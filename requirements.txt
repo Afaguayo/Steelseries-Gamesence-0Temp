@@ -1,0 +1,1 @@
+psutil>=5.9  # CPU load, RAM, and CPU temperature on Linux
