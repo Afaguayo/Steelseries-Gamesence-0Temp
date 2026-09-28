@@ -176,11 +176,18 @@ def diagnose(builtin=None):
         print(f"{name:42} {result}")
     print(f"\nCombined: {fmt_stats(stats)}")
     if stats.cpu_temp is None:
-        print("\nNo CPU temperature. " + sensors.temperature_help())
-        if sensors.IS_WINDOWS and not sensors.is_admin():
-            print("This app isn't running as administrator, which CPU temperature needs.")
-        if sensors.IS_WINDOWS and not pawnio.installed_version():
-            print("PawnIO isn't installed: run SteelSeriesTemps.exe --install-driver")
+        admin, driver = sensors.is_admin(), pawnio.installed_version()
+        if sensors.IS_WINDOWS and admin and driver:
+            print("\nNo CPU temperature, although PawnIO is installed and the app runs as administrator. "
+                  "The CPU's sensor didn't give a reading: this happens on virtual machines and on "
+                  "CPUs too new for LibreHardwareMonitor. HWiNFO or Core Temp may still read it; "
+                  "this app picks them up automatically while they run.")
+        else:
+            print("\nNo CPU temperature. " + sensors.temperature_help())
+            if sensors.IS_WINDOWS and not admin:
+                print("This app isn't running as administrator, which CPU temperature needs.")
+            if sensors.IS_WINDOWS and not driver:
+                print("PawnIO isn't installed: run SteelSeriesTemps.exe --install-driver")
     else:
         print("\nCPU temperature is working.")
 
