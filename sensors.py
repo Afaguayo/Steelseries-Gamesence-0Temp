@@ -1,25 +1,36 @@
-"""Read CPU and GPU temperatures and loads, from whatever the OS offers.
+"""Read CPU and GPU temperatures and loads, from whatever this machine offers.
 
 Temperatures aren't exposed the same way anywhere:
-- Windows has no built-in API for them. LibreHardwareMonitor (free, open
-  source) reads the chips and can serve them as JSON on localhost:8085.
-- Linux exposes them through psutil (coretemp, k10temp and friends).
-- macOS needs a helper tool such as smctemp or osx-cpu-temp.
+- Windows has no built-in API for them. This app reads them itself with
+  LibreHardwareMonitor's library (bundled in the .exe), which needs the free
+  PawnIO driver. It can also pick them up from HWiNFO or Core Temp shared
+  memory, or LibreHardwareMonitor's web server, if one of those is running.
 - NVIDIA GPUs report through nvidia-smi on Windows and Linux.
+- Linux exposes CPU temperatures through psutil (coretemp, k10temp, ...).
+- macOS needs a helper tool such as smctemp.
 
-Every reader returns None for what it can't find, and read_stats() merges
-the results, so the display always shows whatever is available.
+Every source turns its data into Readings, pick() chooses the best CPU/GPU
+values from them, and read_stats() merges sources so the display always
+shows whatever is available.
 """
+import ctypes
 import json
+import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import urllib.request
+from collections import namedtuple
 from dataclasses import dataclass
 from typing import Optional
 
 LHM_URL = "http://127.0.0.1:8085/data.json"
+IS_WINDOWS = sys.platform == "win32"
+
+# kind: cpu / gpu / ram; group: temp / load
+Reading = namedtuple("Reading", "kind group name value")
 
 
 @dataclass
@@ -44,59 +55,92 @@ def number(text):
     return float(match.group().replace(",", ".")) if match else None
 
 
-# ------------------------------------------------------ LibreHardwareMonitor
+# Preferred sensor names, best first. Anything else in the same group is used
+# only if none of these exist (e.g. a single "Core #1" reading).
+PREFERRED = {
+    ("cpu", "temp"): ["CPU Package", "Core (Tctl/Tdie)", "CPU (Tctl/Tdie)", "Tctl/Tdie", "Tdie", "Tctl",
+                      "Core Max", "Core Average", "CPU Cores"],
+    ("gpu", "temp"): ["GPU Core", "GPU Temperature", "GPU Hot Spot"],
+    ("cpu", "load"): ["CPU Total", "Total CPU Usage"],
+    ("gpu", "load"): ["GPU Core", "GPU Core Load", "GPU Utilization", "D3D 3D"],
+    ("ram", "load"): ["Memory", "Physical Memory Load"],
+}
 
-def parse_lhm(tree):
-    """Pick CPU/GPU temperature and load and RAM use out of LHM's sensor tree.
 
-    The tree nests hardware -> sensor group ("Temperatures", "Load") ->
-    sensor. Hardware is recognized by its icon, which LHM sets per type.
+TEMP_RANGE = (1.0, 150.0)          # °C; anything outside is a sensor that isn't really reading
+
+
+def pick(readings):
+    """Choose one value per stat from a list of Readings."""
+    best = {}
+    for kind, group, name, value in readings:
+        if value is None or value != value:            # skip missing / NaN
+            continue
+        # A sensor the driver can't read often reports 0 °C instead of nothing
+        # (seen with LibreHardwareMonitor on virtual machines); treat
+        # implausible temperatures as missing so the screen shows -- not 0°C.
+        if group == "temp" and not TEMP_RANGE[0] <= value <= TEMP_RANGE[1]:
+            continue
+        key = (kind, group)
+        names = PREFERRED.get(key, [])
+        rank = names.index(name) if name in names else len(names)
+        if key not in best or rank < best[key][0]:
+            best[key] = (rank, float(value))
+    get = lambda key: best[key][1] if key in best else None  # noqa: E731
+    return Stats(cpu_temp=get(("cpu", "temp")), cpu_load=get(("cpu", "load")),
+                 gpu_temp=get(("gpu", "temp")), gpu_load=get(("gpu", "load")),
+                 ram=get(("ram", "load")))
+
+
+def kind_from_hardware(hardware_type="", hardware_id="", icon=""):
+    """LibreHardwareMonitor hardware -> cpu / gpu / ram / None."""
+    text = f"{hardware_type} {hardware_id} {icon}".lower()
+    if "gpu" in text or any(k in icon.lower() for k in ("nvidia.png", "ati.png", "intel.png")):
+        return "gpu"
+    if "cpu" in text:
+        return "cpu"
+    if "memory" in text or "/ram" in text or "ram.png" in text:
+        return "ram"
+    return None
+
+
+GROUPS = {"Temperature": "temp", "Temperatures": "temp", "Load": "load"}
+
+
+# ------------------------------------------- LibreHardwareMonitor web server
+
+def lhm_readings(tree):
+    """Readings from LibreHardwareMonitor's data.json.
+
+    Nesting is hardware -> sensor type ("Temperatures", "Load") -> sensor.
+    Newer versions tag hardware with HardwareId (/intelcpu/0, /gpu-nvidia/0)
+    and sensors with Type; older ones only give an icon per hardware type.
     """
-    stats = Stats()
-    preferred = {
-        ("cpu", "Temperatures"): ["CPU Package", "Core (Tctl/Tdie)", "Core Max", "Core Average"],
-        ("gpu", "Temperatures"): ["GPU Core", "GPU Hot Spot"],
-        ("cpu", "Load"): ["CPU Total"],
-        ("gpu", "Load"): ["GPU Core", "D3D 3D"],
-        ("ram", "Load"): ["Memory"],
-    }
-    found = {}
-
-    def kind_of(node):
-        icon = (node.get("ImageURL") or "").lower()
-        if "cpu" in icon:
-            return "cpu"
-        if any(k in icon for k in ("nvidia", "ati", "amd", "intel")) and "cpu" not in icon:
-            return "gpu"
-        if "ram" in icon:
-            return "ram"
-        return None
+    readings = []
 
     def walk(node, kind=None, group=None):
-        kind = kind_of(node) or kind
-        text = node.get("Text", "")
-        if text in ("Temperatures", "Load"):
-            group = text
+        hardware_id = node.get("HardwareId")
+        if hardware_id:
+            # Trust the id: LHM gives unknown hardware types the CPU icon.
+            kind = kind_from_hardware(hardware_id=hardware_id)
+        elif "images_icon/" in (node.get("ImageURL") or ""):
+            kind = kind_from_hardware(icon=node["ImageURL"]) or kind
+        group = GROUPS.get(node.get("Type") or node.get("Text"), group)
         children = node.get("Children") or []
         if not children and kind and group:
-            names = preferred.get((kind, group), [])
-            value = number(node.get("Value"))
-            if value is not None:
-                rank = names.index(text) if text in names else len(names)
-                key = (kind, group)
-                if key not in found or rank < found[key][0]:
-                    found[key] = (rank, value)
+            value = node.get("RawValue")
+            if not isinstance(value, (int, float)):
+                value = number(node.get("Value"))
+            readings.append(Reading(kind, group, node.get("Text", ""), value))
         for child in children:
             walk(child, kind, group)
 
     walk(tree)
-    get = lambda key: found[key][1] if key in found else None  # noqa: E731
-    stats.cpu_temp = get(("cpu", "Temperatures"))
-    stats.gpu_temp = get(("gpu", "Temperatures"))
-    stats.cpu_load = get(("cpu", "Load"))
-    stats.gpu_load = get(("gpu", "Load"))
-    stats.ram = get(("ram", "Load"))
-    return stats
+    return readings
+
+
+def parse_lhm(tree):
+    return pick(lhm_readings(tree))
 
 
 def read_lhm(url=LHM_URL, timeout=1.0):
@@ -105,6 +149,216 @@ def read_lhm(url=LHM_URL, timeout=1.0):
             return parse_lhm(json.load(response))
     except (OSError, ValueError):
         return Stats()
+
+
+# ------------------------------------- built-in LibreHardwareMonitor library
+
+def bundled_lhm_dir():
+    """Folder with LibreHardwareMonitorLib.dll: next to the app, or inside the .exe."""
+    for base in (getattr(sys, "_MEIPASS", None), os.path.dirname(os.path.abspath(__file__))):
+        if base and os.path.isfile(os.path.join(base, "lhm", "LibreHardwareMonitorLib.dll")):
+            return os.path.join(base, "lhm")
+    return None
+
+
+class BuiltinSensors:
+    """Reads sensors in-process with LibreHardwareMonitorLib (Windows only).
+
+    CPU temperatures need administrator rights and the PawnIO driver; GPU
+    temperatures and loads usually work without them.
+    """
+
+    def __init__(self, lib_dir=None):
+        self.error = None
+        self.computer = None
+        self.hardware_names = []
+        lib_dir = lib_dir or bundled_lhm_dir()
+        if not IS_WINDOWS:
+            self.error = "only available on Windows"
+            return
+        if not lib_dir:
+            self.error = "LibreHardwareMonitorLib.dll not found"
+            return
+        try:
+            from pythonnet import load
+            try:
+                load("netfx")                     # .NET Framework, built into Windows
+            except RuntimeError:
+                pass                              # a runtime is already loaded
+            import clr
+            sys.path.append(lib_dir)
+            clr.AddReference(os.path.join(lib_dir, "LibreHardwareMonitorLib.dll"))
+            from LibreHardwareMonitor.Hardware import Computer
+            computer = Computer()
+            computer.IsCpuEnabled = True
+            computer.IsGpuEnabled = True
+            computer.IsMemoryEnabled = True
+            computer.Open()
+            self.computer = computer
+            self.hardware_names = [f"{h.HardwareType}: {h.Name}" for h in computer.Hardware]
+        except Exception as exc:                  # missing .NET, blocked DLL, etc.
+            self.error = f"{type(exc).__name__}: {exc}"
+
+    @property
+    def ok(self):
+        return self.computer is not None
+
+    def readings(self):
+        if not self.computer:
+            return []
+        readings = []
+
+        def collect(hardware):
+            hardware.Update()
+            kind = kind_from_hardware(hardware_type=str(hardware.HardwareType))
+            for sensor in hardware.Sensors:
+                group = GROUPS.get(str(sensor.SensorType))
+                if kind and group:
+                    value = sensor.Value
+                    readings.append(Reading(kind, group, str(sensor.Name),
+                                            None if value is None else float(value)))
+            for sub in hardware.SubHardware:
+                collect(sub)
+
+        for hardware in self.computer.Hardware:
+            try:
+                collect(hardware)
+            except Exception:                     # one bad device shouldn't stop the rest
+                continue
+        return readings
+
+    def read(self):
+        return pick(self.readings())
+
+    def close(self):
+        if self.computer:
+            try:
+                self.computer.Close()
+            except Exception:
+                pass
+            self.computer = None
+
+
+# -------------------------------------------------- Windows shared memory
+
+def read_shared_memory(names, size):
+    """Bytes of an existing named file mapping, or None if no app created it."""
+    if not IS_WINDOWS:
+        return None
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenFileMappingW.restype = ctypes.c_void_p
+    kernel32.OpenFileMappingW.argtypes = [ctypes.c_uint32, ctypes.c_bool, ctypes.c_wchar_p]
+    kernel32.MapViewOfFile.restype = ctypes.c_void_p
+    kernel32.MapViewOfFile.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32,
+                                       ctypes.c_uint32, ctypes.c_size_t]
+    kernel32.UnmapViewOfFile.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    FILE_MAP_READ = 0x0004
+    for name in names:
+        handle = kernel32.OpenFileMappingW(FILE_MAP_READ, False, name)
+        if not handle:
+            continue
+        try:
+            view = kernel32.MapViewOfFile(handle, FILE_MAP_READ, 0, 0, size)
+            if not view:
+                continue
+            try:
+                return ctypes.string_at(view, size)
+            finally:
+                kernel32.UnmapViewOfFile(view)
+        finally:
+            kernel32.CloseHandle(handle)
+    return None
+
+
+# HWiNFO: "Settings > Shared Memory Support" must be on.
+HWINFO_NAMES = ["Global\\HWiNFO_SENS_SM2", "HWiNFO_SENS_SM2"]
+HWINFO_HEADER = struct.Struct("<4sIIqIIIIII")        # 44 bytes, packed
+HWINFO_READING_TYPES = {1: "temp", 7: "load"}          # SENSOR_READING_TYPE: 1 temperature, 7 usage
+
+
+def _cstr(raw):
+    return raw.split(b"\0", 1)[0].decode("latin-1").strip()
+
+
+def hwinfo_readings(data):
+    """Readings from HWiNFO's shared-memory block."""
+    if not data or len(data) < HWINFO_HEADER.size:
+        return []
+    sig, _ver, _rev, _time, off_s, size_s, num_s, off_r, size_r, num_r = HWINFO_HEADER.unpack_from(data)
+    if sig not in (b"HWiS", b"SiWH"):
+        return []
+    sensor_names = []
+    for i in range(num_s):
+        start = off_s + i * size_s
+        # dwSensorID, dwSensorInst, szSensorNameOrig[128], szSensorNameUser[128]
+        sensor_names.append(_cstr(data[start + 8:start + 136]))
+    readings = []
+    for i in range(num_r):
+        start = off_r + i * size_r
+        if start + 316 > len(data):
+            break
+        rtype, sensor_index, _rid = struct.unpack_from("<III", data, start)
+        label = _cstr(data[start + 12:start + 140])
+        value = struct.unpack_from("<d", data, start + 12 + 128 + 128 + 16)[0]
+        group = HWINFO_READING_TYPES.get(rtype)
+        if not group:
+            continue
+        sensor = sensor_names[sensor_index] if sensor_index < len(sensor_names) else ""
+        text = f"{sensor} {label}".lower()
+        if label in ("Physical Memory Load",):
+            kind = "ram"
+        elif "gpu" in text:
+            kind = "gpu"
+        elif "cpu" in text or "core" in label.lower() or "tctl" in text or "tdie" in text:
+            kind = "cpu"
+        else:
+            continue
+        readings.append(Reading(kind, group, label, value))
+    return readings
+
+
+def read_hwinfo():
+    header = read_shared_memory(HWINFO_NAMES, HWINFO_HEADER.size)
+    if not header:
+        return Stats()
+    _s, _v, _r, _t, off_s, size_s, num_s, off_r, size_r, num_r = HWINFO_HEADER.unpack_from(header)
+    total = max(off_s + size_s * num_s, off_r + size_r * num_r)
+    return pick(hwinfo_readings(read_shared_memory(HWINFO_NAMES, total)))
+
+
+# Core Temp: shared memory is on by default while it runs.
+CORETEMP_NAMES = ["CoreTempMappingObjectEx", "CoreTempMappingObject",
+                  "Global\\CoreTempMappingObjectEx", "Global\\CoreTempMappingObject"]
+CORETEMP_SIZE = 2686
+
+
+def coretemp_stats(data):
+    """Stats from Core Temp's CORE_TEMP_SHARED_DATA block."""
+    if not data or len(data) < CORETEMP_SIZE:
+        return Stats()
+    loads = struct.unpack_from("<256I", data, 0)
+    tjmax = struct.unpack_from("<128I", data, 1024)
+    cores, cpus = struct.unpack_from("<II", data, 1536)
+    temps = struct.unpack_from("<256f", data, 1544)
+    fahrenheit, delta_to_tjmax = data[2684], data[2685]
+    count = cores * max(cpus, 1)
+    if not 0 < count <= 256:
+        return Stats()
+    values = []
+    for i in range(count):
+        t = temps[i]
+        if delta_to_tjmax:                    # value is distance below TjMax
+            t = tjmax[i // cores if cores else 0] - t
+        if fahrenheit:
+            t = (t - 32) * 5 / 9
+        values.append(t)
+    values = [v for v in values if TEMP_RANGE[0] <= v <= TEMP_RANGE[1]]
+    return Stats(cpu_temp=max(values) if values else None, cpu_load=sum(loads[:count]) / count)
+
+
+def read_coretemp():
+    return coretemp_stats(read_shared_memory(CORETEMP_NAMES, CORETEMP_SIZE))
 
 
 # ------------------------------------------------------------------ nvidia
@@ -182,23 +436,47 @@ def read_mac_tool():
     return Stats()
 
 
-def read_stats():
+# ------------------------------------------------------------------ merging
+
+def sources(builtin=None):
+    """(name, reader) pairs for this OS, best first."""
+    found = []
+    if IS_WINDOWS:
+        if builtin is not None and builtin.ok:
+            found.append(("built-in (LibreHardwareMonitor library)", builtin.read))
+        found += [("HWiNFO shared memory", read_hwinfo), ("Core Temp shared memory", read_coretemp),
+                  ("LibreHardwareMonitor web server", read_lhm)]
+    if sys.platform == "darwin":
+        found.append(("smctemp / osx-cpu-temp", read_mac_tool))
+    found += [("nvidia-smi", read_nvidia), ("psutil", read_psutil)]
+    return found
+
+
+def read_stats(builtin=None):
     """Everything we can read on this machine, best sources first."""
     stats = Stats()
-    if sys.platform == "win32":
-        stats.merge(read_lhm())
-    if sys.platform == "darwin":
-        stats.merge(read_mac_tool())
-    stats.merge(read_nvidia())
-    stats.merge(read_psutil())
+    for _name, reader in sources(builtin):
+        stats.merge(reader())
+        if None not in (stats.cpu_temp, stats.cpu_load, stats.gpu_temp, stats.gpu_load, stats.ram):
+            break
     return stats
 
 
+def is_admin():
+    if not IS_WINDOWS:
+        return os.geteuid() == 0 if hasattr(os, "geteuid") else False
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
 def temperature_help():
-    """What to install when no CPU temperature can be read on this OS."""
-    if sys.platform == "win32":
-        return ("To show temperatures, run LibreHardwareMonitor (https://github.com/LibreHardwareMonitor/"
-                "LibreHardwareMonitor) as administrator and turn on Options > Remote Web Server (port 8085).")
+    """What to do when no CPU temperature can be read on this OS."""
+    if IS_WINDOWS:
+        return ("CPU temperature needs administrator rights and the free PawnIO driver. Run "
+                "SteelSeriesTemps.exe --install-driver, or run HWiNFO (with Shared Memory Support on) "
+                "or Core Temp. Run SteelSeriesTemps.exe --diagnose for details.")
     if sys.platform == "darwin":
         return "To show the CPU temperature, install smctemp (https://github.com/narugit/smctemp)."
     return "To show the CPU temperature, load your CPU's sensor driver (try: sudo sensors-detect)."

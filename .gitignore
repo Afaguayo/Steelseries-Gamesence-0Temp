@@ -6,3 +6,4 @@ dist/
 .venv/
 venv/
 .DS_Store
+lhm-ci/

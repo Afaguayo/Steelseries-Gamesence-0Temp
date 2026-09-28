@@ -6,6 +6,9 @@
     python3 temps.py --no-rgb         # screen only, leave the key lighting alone
     python3 temps.py --print          # just print readings; no SteelSeries gear needed
     python3 temps.py --once           # print one reading and exit (check your sensors)
+    python3 temps.py --diagnose       # show what every temperature source reports
+    python3 temps.py --install-driver # install PawnIO, needed for CPU temperature on Windows
+    SteelSeriesTemps.exe --autostart on   # start with Windows, as admin, without a prompt
 
 The OLED shows two lines, for example:
 
@@ -17,10 +20,12 @@ heats up (between --cool and --hot degrees).
 """
 import argparse
 import signal
+import subprocess
 import sys
 import time
 
 import gamesense
+import pawnio
 import sensors
 
 
@@ -129,6 +134,89 @@ def run(args, read=None, display=None, sleep=time.sleep, ticks=None):
             display.close()
 
 
+def fmt_stats(stats):
+    parts = [f"{name}={getattr(stats, name):.1f}" for name in stats.__dataclass_fields__
+             if getattr(stats, name) is not None]
+    return ", ".join(parts) if parts else "nothing"
+
+
+def diagnose(builtin=None):
+    """Print what every temperature source on this machine reports."""
+    print(f"System: {sys.platform}, administrator: {'yes' if sensors.is_admin() else 'no'}")
+    if sensors.IS_WINDOWS:
+        version = pawnio.installed_version()
+        print(f"PawnIO driver: {version or 'not installed'}")
+        if builtin is not None:
+            if builtin.ok:
+                print("Built-in sensor library: loaded")
+                for name in builtin.hardware_names:
+                    print(f"    found {name}")
+                temps = [r for r in builtin.readings() if r.group == "temp"]
+                for r in temps:
+                    if r.value is None:
+                        shown = "no value"
+                    elif not sensors.TEMP_RANGE[0] <= r.value <= sensors.TEMP_RANGE[1]:
+                        shown = f"{r.value:.1f} C (not a real reading; ignored)"
+                    else:
+                        shown = f"{r.value:.1f} C"
+                    print(f"    {r.kind} temperature '{r.name}': {shown}")
+                if not temps:
+                    print("    no temperature sensors reported")
+            else:
+                print(f"Built-in sensor library: not available ({builtin.error})")
+    print()
+    stats = sensors.Stats()
+    for name, reader in sensors.sources(builtin):
+        try:
+            reading = reader()
+            stats.merge(reading)                 # same order read_stats() uses
+            result = fmt_stats(reading)
+        except Exception as exc:
+            result = f"error: {exc}"
+        print(f"{name:42} {result}")
+    print(f"\nCombined: {fmt_stats(stats)}")
+    if stats.cpu_temp is None:
+        admin, driver = sensors.is_admin(), pawnio.installed_version()
+        if sensors.IS_WINDOWS and admin and driver:
+            print("\nNo CPU temperature, although PawnIO is installed and the app runs as administrator. "
+                  "The CPU's sensor didn't give a reading: this happens on virtual machines and on "
+                  "CPUs too new for LibreHardwareMonitor. HWiNFO or Core Temp may still read it; "
+                  "this app picks them up automatically while they run.")
+        else:
+            print("\nNo CPU temperature. " + sensors.temperature_help())
+            if sensors.IS_WINDOWS and not admin:
+                print("This app isn't running as administrator, which CPU temperature needs.")
+            if sensors.IS_WINDOWS and not driver:
+                print("PawnIO isn't installed: run SteelSeriesTemps.exe --install-driver")
+    else:
+        print("\nCPU temperature is working.")
+
+
+TASK_NAME = "SteelSeriesTemps"
+
+
+def autostart(enable, exe=None, run=subprocess.run):
+    """Start with Windows via a logon task with highest privileges.
+
+    A Startup-folder shortcut would show a UAC prompt at every login because
+    the app needs administrator rights; a scheduled task doesn't.
+    """
+    if enable:
+        exe = exe or sys.executable
+        command = ["schtasks", "/Create", "/TN", TASK_NAME, "/TR", f'"{exe}"',
+                   "/SC", "ONLOGON", "/RL", "HIGHEST", "/F"]
+    else:
+        command = ["schtasks", "/Delete", "/TN", TASK_NAME, "/F"]
+    return run(command, capture_output=True, text=True).returncode == 0
+
+
+def open_builtin():
+    """Start the in-process sensor reader on Windows (None elsewhere)."""
+    if not sensors.IS_WINDOWS:
+        return None
+    return sensors.BuiltinSensors()
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--interval", type=float, default=1.0, help="seconds between updates (default: 1)")
@@ -139,6 +227,11 @@ def main(argv=None):
     ap.add_argument("--ascii", action="store_true", help="write 54C instead of 54°C")
     ap.add_argument("--print", action="store_true", help="print readings instead of sending them to GG")
     ap.add_argument("--once", action="store_true", help="print one reading and exit")
+    ap.add_argument("--diagnose", action="store_true", help="show what every temperature source reports")
+    ap.add_argument("--install-driver", action="store_true",
+                    help="install PawnIO, the driver needed for CPU temperature on Windows")
+    ap.add_argument("--autostart", choices=["on", "off"],
+                    help="start automatically when you log in to Windows (uses Task Scheduler)")
     args = ap.parse_args(argv)
     if args.hot <= args.cool:
         ap.error("--hot must be higher than --cool")
@@ -149,16 +242,56 @@ def main(argv=None):
     # clean shutdown, which hands the OLED back to GG.
     signal.signal(signal.SIGTERM, signal.default_int_handler)
 
-    # psutil measures CPU load between calls, so prime it once.
-    sensors.read_psutil()
-    if args.once:
-        time.sleep(0.5)                  # give psutil a moment to measure load
-        args.print = True
-        run(args, ticks=1, sleep=lambda s: None)
+    if args.autostart:
+        if not sensors.IS_WINDOWS or not getattr(sys, "frozen", False):
+            ap.error("--autostart works with SteelSeriesTemps.exe on Windows")
+        ok = autostart(args.autostart == "on")
+        state = "will start" if args.autostart == "on" else "won't start"
+        print(f"SteelSeriesTemps {state} when you log in." if ok else "Couldn't change the startup task.")
         return
-    if not args.print:
-        print("Sending temperatures to SteelSeries GG. Press Ctrl+C to stop.", file=sys.stderr)
-    run(args)
+
+    if args.install_driver:
+        if not sensors.IS_WINDOWS:
+            ap.error("PawnIO is only needed on Windows")
+        settings = pawnio.load_settings()
+        settings.pop("pawnio_declined", None)
+        pawnio.save_settings(settings)
+        ok = pawnio.install()
+        print("PawnIO installed. Restart SteelSeriesTemps." if ok else "PawnIO setup didn't finish.")
+        return
+
+    builtin = open_builtin()
+    try:
+        if args.diagnose:
+            sensors.read_psutil()
+            time.sleep(0.5)
+            diagnose(builtin)
+            return
+
+        # On Windows, CPU temperature needs the PawnIO driver: offer it once.
+        interactive = sys.stdin is not None and sys.stdin.isatty()
+        if (builtin is not None and builtin.ok and not args.once and interactive
+                and not pawnio.installed_version()):
+            if pawnio.offer_install():
+                builtin.close()
+                builtin = open_builtin()
+        if sensors.IS_WINDOWS and not sensors.is_admin():
+            print("Note: not running as administrator, so CPU temperature may be missing.", file=sys.stderr)
+
+        read = lambda: sensors.read_stats(builtin)  # noqa: E731
+        # psutil measures CPU load between calls, so prime it once.
+        sensors.read_psutil()
+        if args.once:
+            time.sleep(0.5)                  # give psutil a moment to measure load
+            args.print = True
+            run(args, read=read, ticks=1, sleep=lambda s: None)
+            return
+        if not args.print:
+            print("Sending temperatures to SteelSeries GG. Press Ctrl+C to stop.", file=sys.stderr)
+        run(args, read=read)
+    finally:
+        if builtin is not None:
+            builtin.close()
 
 
 if __name__ == "__main__":

@@ -16,9 +16,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import mock
 
 import gamesense
+import pawnio
 import sensors
+import struct
+import sys
 import temps
-from sensors import Stats
+from sensors import Reading, Stats
 
 
 class FakeGameSense:
@@ -289,6 +292,223 @@ class DisplayLoopTests(unittest.TestCase):
             for bad in (["--hot", "30", "--cool", "40"], ["--interval", "0.01"]):
                 with self.subTest(args=bad), self.assertRaises(SystemExit):
                     temps.main(bad)
+
+
+# LibreHardwareMonitor 0.9.x data.json: hardware carries HardwareId, sensors
+# carry Type/SensorId/RawValue. Unknown hardware types get the CPU icon, so
+# the id must win over the icon.
+LHM_NEW_SAMPLE = {"id": 0, "Text": "Sensor", "ImageURL": "", "Children": [{
+    "id": 1, "Text": "PC", "ImageURL": "images_icon/computer.png", "Children": [
+        {"Text": "Intel Core i7-12700K", "HardwareId": "/intelcpu/0", "ImageURL": "images_icon/cpu.png", "Children": [
+            {"Text": "Temperatures", "ImageURL": "images_icon/temperature.png", "Children": [
+                {"Text": "Core Max", "Type": "Temperature", "SensorId": "/intelcpu/0/temperature/8",
+                 "Value": "71,0 °C", "RawValue": 71.0, "Children": []},
+                {"Text": "CPU Package", "Type": "Temperature", "SensorId": "/intelcpu/0/temperature/9",
+                 "Value": "68,5 °C", "RawValue": 68.5, "Children": []}]},
+            {"Text": "Load", "ImageURL": "images_icon/load.png", "Children": [
+                {"Text": "CPU Total", "Type": "Load", "Value": "12,5 %", "RawValue": 12.5, "Children": []}]}]},
+        {"Text": "Embedded Controller", "HardwareId": "/embeddedcontroller/0", "ImageURL": "images_icon/cpu.png",
+         "Children": [{"Text": "Temperatures", "Children": [
+             {"Text": "CPU Package", "Type": "Temperature", "Value": "99,0 °C", "RawValue": 99.0, "Children": []}]}]},
+        {"Text": "Nuvoton NCT6798D", "HardwareId": "/lpc/nct6798d/0", "ImageURL": "images_icon/chip.png",
+         "Children": [{"Text": "Temperatures", "Children": [
+             {"Text": "CPU", "Type": "Temperature", "Value": "40,0 °C", "RawValue": 40.0, "Children": []}]}]},
+        {"Text": "NVIDIA GeForce RTX 4070", "HardwareId": "/gpu-nvidia/0", "ImageURL": "images_icon/nvidia.png",
+         "Children": [{"Text": "Temperatures", "Children": [
+             {"Text": "GPU Core", "Type": "Temperature", "Value": "55,0 °C", "RawValue": 55.0, "Children": []}]}]},
+        {"Text": "Total Memory", "HardwareId": "/ram", "ImageURL": "images_icon/ram.png", "Children": [
+            {"Text": "Load", "Children": [
+                {"Text": "Memory", "Type": "Load", "Value": "41,0 %", "RawValue": 41.0, "Children": []}]}]},
+    ]}]}
+
+
+def hwinfo_block(sensors_list, readings):
+    """Build an HWiNFO shared-memory block like HWiNFO does (packed structs)."""
+    sensor_size, reading_size = 264, 316
+    off_s = 44
+    off_r = off_s + sensor_size * len(sensors_list)
+    data = bytearray(off_r + reading_size * len(readings))
+    struct.pack_into("<4sIIqIIIIII", data, 0, b"HWiS", 2, 0, 0, off_s, sensor_size, len(sensors_list),
+                     off_r, reading_size, len(readings))
+    for i, name in enumerate(sensors_list):
+        struct.pack_into("<II128s128s", data, off_s + i * sensor_size, i, 0, name.encode(), name.encode())
+    for i, (rtype, sensor_index, label, value) in enumerate(readings):
+        struct.pack_into("<III128s128s16sdddd", data, off_r + i * reading_size, rtype, sensor_index, i,
+                         label.encode(), label.encode(), b"", value, value, value, value)
+    return bytes(data)
+
+
+def coretemp_block(temps, loads, tjmax=100, fahrenheit=0, delta=0, cpus=1):
+    data = bytearray(sensors.CORETEMP_SIZE)
+    struct.pack_into("<256I", data, 0, *(loads + [0] * (256 - len(loads))))
+    struct.pack_into("<128I", data, 1024, *([tjmax] * 128))
+    struct.pack_into("<II", data, 1536, len(temps) // cpus, cpus)
+    struct.pack_into("<256f", data, 1544, *(temps + [0.0] * (256 - len(temps))))
+    data[2684], data[2685] = fahrenheit, delta
+    return bytes(data)
+
+
+class NewSourceTests(unittest.TestCase):
+    def test_lhm_new_format_uses_hardware_id(self):
+        stats = sensors.parse_lhm(LHM_NEW_SAMPLE)
+        self.assertEqual(stats, Stats(cpu_temp=68.5, cpu_load=12.5, gpu_temp=55.0, ram=41.0))
+
+    def test_pick_prefers_named_sensors_and_skips_missing(self):
+        stats = sensors.pick([Reading("cpu", "temp", "Core #1", 60), Reading("cpu", "temp", "CPU Package", None),
+                              Reading("cpu", "temp", "Core Max", 64), Reading("cpu", "temp", "Tctl", float("nan"))])
+        self.assertEqual(stats.cpu_temp, 64)
+
+    def test_zero_or_impossible_temperature_is_missing(self):
+        # LibreHardwareMonitor on a VM reports Tctl/Tdie as 0.0 when it can't read it.
+        stats = sensors.pick([Reading("cpu", "temp", "Core (Tctl/Tdie)", 0.0), Reading("cpu", "load", "CPU Total", 6.1),
+                              Reading("gpu", "temp", "GPU Core", 255.0)])
+        self.assertEqual(stats, Stats(cpu_load=6.1))
+        self.assertEqual(temps.screen_lines(stats)[0], "CPU --  6%")
+
+    def test_hwinfo_intel_and_nvidia(self):
+        data = hwinfo_block(
+            ["CPU [#0]: Intel Core i7-12700K", "GPU [#0]: NVIDIA GeForce RTX 4070", "System: ASUS", "S.M.A.R.T.: SSD"],
+            [(1, 0, "Core Max", 70.0), (1, 0, "CPU Package", 66.0), (7, 0, "Total CPU Usage", 18.0),
+             (1, 1, "GPU Temperature", 52.0), (7, 1, "GPU Core Load", 35.0),
+             (7, 2, "Physical Memory Load", 44.0), (1, 3, "Drive Temperature", 38.0), (3, 0, "CPU Fan", 1200.0)])
+        self.assertEqual(sensors.pick(sensors.hwinfo_readings(data)),
+                         Stats(cpu_temp=66.0, cpu_load=18.0, gpu_temp=52.0, gpu_load=35.0, ram=44.0))
+
+    def test_hwinfo_amd_tctl(self):
+        data = hwinfo_block(["CPU [#0]: AMD Ryzen 7 7800X3D: Enhanced"],
+                            [(1, 0, "CPU (Tctl/Tdie)", 74.5), (1, 0, "CPU Die (average)", 70.0)])
+        self.assertEqual(sensors.pick(sensors.hwinfo_readings(data)).cpu_temp, 74.5)
+
+    def test_hwinfo_rejects_garbage(self):
+        self.assertEqual(sensors.hwinfo_readings(b""), [])
+        self.assertEqual(sensors.hwinfo_readings(b"XXXX" + bytes(60)), [])
+
+    def test_coretemp(self):
+        stats = sensors.coretemp_stats(coretemp_block([55.0, 61.0, 58.0, 57.0], [10, 20, 30, 40]))
+        self.assertEqual((stats.cpu_temp, stats.cpu_load), (61.0, 25.0))
+
+    def test_coretemp_distance_to_tjmax_and_fahrenheit(self):
+        stats = sensors.coretemp_stats(coretemp_block([40.0, 35.0], [0, 0], tjmax=100, delta=1))
+        self.assertEqual(stats.cpu_temp, 65.0)
+        stats = sensors.coretemp_stats(coretemp_block([140.0, 131.0], [0, 0], fahrenheit=1))
+        self.assertAlmostEqual(stats.cpu_temp, 60.0)
+
+    def test_coretemp_not_running(self):
+        self.assertEqual(sensors.coretemp_stats(None), Stats())
+        self.assertEqual(sensors.coretemp_stats(bytes(sensors.CORETEMP_SIZE)), Stats())
+
+    @unittest.skipIf(sys.platform == "win32", "checks the non-Windows fallback")
+    def test_builtin_is_windows_only(self):
+        builtin = sensors.BuiltinSensors()
+        self.assertFalse(builtin.ok)
+        self.assertEqual(builtin.read(), Stats())
+
+    def test_sources_order(self):
+        class Fake:
+            ok = True
+            read = staticmethod(lambda: Stats(cpu_temp=50))
+        names = [name for name, _ in sensors.sources(Fake())]
+        if sys.platform == "win32":
+            self.assertTrue(names[0].startswith("built-in"))
+        self.assertEqual(names[-1], "psutil")
+
+    def test_read_stats_merges_in_order(self):
+        with mock.patch.object(sensors, "sources", return_value=[
+                ("a", lambda: Stats(cpu_temp=70)), ("b", lambda: Stats(cpu_temp=10, cpu_load=5, ram=30))]):
+            self.assertEqual(sensors.read_stats(), Stats(cpu_temp=70, cpu_load=5, ram=30))
+
+
+class PawnIOTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.settings = os.path.join(self.dir.name, "settings.json")
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def test_yes_installs(self):
+        calls = []
+        with mock.patch("builtins.print"):
+            ok = pawnio.offer_install(ask=lambda q: "", settings_path=self.settings,
+                                      installer=lambda: calls.append(1) or True)
+        self.assertTrue(ok)
+        self.assertEqual(calls, [1])
+
+    def test_no_is_remembered(self):
+        asked = []
+        with mock.patch("builtins.print"):
+            pawnio.offer_install(ask=lambda q: asked.append(q) or "n", settings_path=self.settings,
+                                 installer=lambda: self.fail("should not install"))
+            pawnio.offer_install(ask=lambda q: asked.append(q) or "y", settings_path=self.settings,
+                                 installer=lambda: self.fail("should not ask again"))
+        self.assertEqual(len(asked), 1)
+        self.assertTrue(pawnio.load_settings(self.settings)["pawnio_declined"])
+
+    def test_install_runs_setup_with_install_flag(self):
+        ran = []
+        with mock.patch("urllib.request.urlretrieve"), mock.patch("builtins.print"):
+            ok = pawnio.install(run=lambda cmd: ran.append(cmd) or mock.Mock(returncode=0))
+        self.assertTrue(ok)
+        self.assertEqual(ran[0][1], "-install")
+        self.assertTrue(ran[0][0].endswith("PawnIO_setup.exe"))
+
+    @unittest.skipIf(sys.platform == "win32", "PawnIO can really be installed on Windows")
+    def test_not_installed_off_windows(self):
+        self.assertIsNone(pawnio.installed_version())
+
+
+class AutostartTests(unittest.TestCase):
+    def test_on_creates_elevated_logon_task(self):
+        seen = []
+        ok = temps.autostart(True, exe=r"C:\Apps\SteelSeriesTemps.exe",
+                             run=lambda cmd, **kw: seen.append(cmd) or mock.Mock(returncode=0))
+        self.assertTrue(ok)
+        cmd = seen[0]
+        self.assertEqual(cmd[:4], ["schtasks", "/Create", "/TN", "SteelSeriesTemps"])
+        self.assertIn('"C:\\Apps\\SteelSeriesTemps.exe"', cmd)
+        self.assertEqual(cmd[cmd.index("/SC") + 1], "ONLOGON")
+        self.assertEqual(cmd[cmd.index("/RL") + 1], "HIGHEST")
+
+    def test_off_deletes_task(self):
+        seen = []
+        temps.autostart(False, run=lambda cmd, **kw: seen.append(cmd) or mock.Mock(returncode=0))
+        self.assertEqual(seen[0], ["schtasks", "/Delete", "/TN", "SteelSeriesTemps", "/F"])
+
+
+class DiagnoseTests(unittest.TestCase):
+    def test_diagnose_reports_sources_and_help(self):
+        with mock.patch.object(sensors, "sources", return_value=[("psutil", lambda: Stats(cpu_load=5, ram=30))]), \
+                mock.patch("builtins.print") as out:
+            temps.diagnose(None)
+        text = "\n".join(str(c.args[0]) if c.args else "" for c in out.call_args_list)
+        self.assertIn("psutil", text)
+        self.assertIn("Combined: cpu_load=5.0, ram=30.0", text)
+        self.assertIn("No CPU temperature", text)
+
+    def test_diagnose_success(self):
+        with mock.patch.object(sensors, "sources", return_value=[("x", lambda: Stats(cpu_temp=60))]), \
+                mock.patch("builtins.print") as out:
+            temps.diagnose(None)
+        self.assertIn("CPU temperature is working.", out.call_args_list[-1].args[0])
+
+
+@unittest.skipUnless(sys.platform == "win32" and os.environ.get("LHM_DIR"),
+                     "Windows with LHM_DIR pointing at LibreHardwareMonitor's DLLs")
+class BuiltinWindowsTests(unittest.TestCase):
+    """Loads the real LibreHardwareMonitorLib.dll (run in CI on Windows)."""
+
+    def test_library_loads_and_finds_hardware(self):
+        builtin = sensors.BuiltinSensors(os.environ["LHM_DIR"])
+        try:
+            self.assertTrue(builtin.ok, builtin.error)
+            self.assertTrue(any(name.startswith("Cpu") for name in builtin.hardware_names), builtin.hardware_names)
+            readings = builtin.readings()
+            print("\nhardware:", builtin.hardware_names)
+            print("readings:", readings)
+            print("picked:", builtin.read())
+            self.assertTrue(any(r.kind == "cpu" and r.group == "load" and r.value is not None for r in readings))
+        finally:
+            builtin.close()
 
 
 if __name__ == "__main__":

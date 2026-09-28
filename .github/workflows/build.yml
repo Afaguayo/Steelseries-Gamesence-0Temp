@@ -22,7 +22,14 @@ jobs:
         with:
           python-version: "3.13"
       - run: pip install -r requirements.txt
-      - run: python -m unittest -v
+      - name: Get LibreHardwareMonitor's library (Windows)
+        if: runner.os == 'Windows'
+        run: python -c "import build; build.fetch_lhm('lhm-ci')"
+      - name: Run tests
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then export LHM_DIR="$PWD/lhm-ci"; fi
+          python -m unittest -v
 
   build:
     needs: test
@@ -34,12 +41,19 @@ jobs:
           python-version: "3.13"
       - run: pip install -r requirements.txt pyinstaller
       - run: python build.py
-      - name: Run the .exe once (reads this machine's sensors)
+      - name: Run the .exe's diagnostics (library bundled and loading)
         shell: pwsh
         run: |
-          $out = & dist\SteelSeriesTemps.exe --once 2>&1 | Out-String
+          $out = & dist\SteelSeriesTemps.exe --diagnose 2>&1 | Out-String
           Write-Output $out
-          if ($LASTEXITCODE -ne 0 -or $out -notmatch 'CPU') { exit 1 }
+          if ($LASTEXITCODE -ne 0 -or $out -notmatch 'Built-in sensor library: loaded') { exit 1 }
+      - name: Try PawnIO on this cloud machine (cloud CPUs often hide sensors, so this can't fail the build)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          Invoke-WebRequest https://github.com/namazso/PawnIO.Setup/releases/latest/download/PawnIO_setup.exe -OutFile PawnIO_setup.exe
+          Start-Process .\PawnIO_setup.exe -ArgumentList '-install','-silent' -Wait
+          & dist\SteelSeriesTemps.exe --diagnose
       - uses: actions/upload-artifact@v4
         with:
           name: SteelSeriesTemps-Windows
