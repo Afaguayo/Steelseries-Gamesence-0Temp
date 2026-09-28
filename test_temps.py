@@ -358,6 +358,13 @@ class NewSourceTests(unittest.TestCase):
                               Reading("cpu", "temp", "Core Max", 64), Reading("cpu", "temp", "Tctl", float("nan"))])
         self.assertEqual(stats.cpu_temp, 64)
 
+    def test_zero_or_impossible_temperature_is_missing(self):
+        # LibreHardwareMonitor on a VM reports Tctl/Tdie as 0.0 when it can't read it.
+        stats = sensors.pick([Reading("cpu", "temp", "Core (Tctl/Tdie)", 0.0), Reading("cpu", "load", "CPU Total", 6.1),
+                              Reading("gpu", "temp", "GPU Core", 255.0)])
+        self.assertEqual(stats, Stats(cpu_load=6.1))
+        self.assertEqual(temps.screen_lines(stats)[0], "CPU --  6%")
+
     def test_hwinfo_intel_and_nvidia(self):
         data = hwinfo_block(
             ["CPU [#0]: Intel Core i7-12700K", "GPU [#0]: NVIDIA GeForce RTX 4070", "System: ASUS", "S.M.A.R.T.: SSD"],
@@ -498,6 +505,7 @@ class BuiltinWindowsTests(unittest.TestCase):
             readings = builtin.readings()
             print("\nhardware:", builtin.hardware_names)
             print("readings:", readings)
+            print("picked:", builtin.read())
             self.assertTrue(any(r.kind == "cpu" and r.group == "load" and r.value is not None for r in readings))
         finally:
             builtin.close()

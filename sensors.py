@@ -67,11 +67,19 @@ PREFERRED = {
 }
 
 
+TEMP_RANGE = (1.0, 150.0)          # °C; anything outside is a sensor that isn't really reading
+
+
 def pick(readings):
     """Choose one value per stat from a list of Readings."""
     best = {}
     for kind, group, name, value in readings:
         if value is None or value != value:            # skip missing / NaN
+            continue
+        # A sensor the driver can't read often reports 0 °C instead of nothing
+        # (seen with LibreHardwareMonitor on virtual machines); treat
+        # implausible temperatures as missing so the screen shows -- not 0°C.
+        if group == "temp" and not TEMP_RANGE[0] <= value <= TEMP_RANGE[1]:
             continue
         key = (kind, group)
         names = PREFERRED.get(key, [])
@@ -345,7 +353,8 @@ def coretemp_stats(data):
         if fahrenheit:
             t = (t - 32) * 5 / 9
         values.append(t)
-    return Stats(cpu_temp=max(values), cpu_load=sum(loads[:count]) / count)
+    values = [v for v in values if TEMP_RANGE[0] <= v <= TEMP_RANGE[1]]
+    return Stats(cpu_temp=max(values) if values else None, cpu_load=sum(loads[:count]) / count)
 
 
 def read_coretemp():

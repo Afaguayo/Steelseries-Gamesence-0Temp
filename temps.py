@@ -153,7 +153,13 @@ def diagnose(builtin=None):
                     print(f"    found {name}")
                 temps = [r for r in builtin.readings() if r.group == "temp"]
                 for r in temps:
-                    print(f"    {r.kind} temperature '{r.name}': {'no value' if r.value is None else f'{r.value:.1f} C'}")
+                    if r.value is None:
+                        shown = "no value"
+                    elif not sensors.TEMP_RANGE[0] <= r.value <= sensors.TEMP_RANGE[1]:
+                        shown = f"{r.value:.1f} C (not a real reading; ignored)"
+                    else:
+                        shown = f"{r.value:.1f} C"
+                    print(f"    {r.kind} temperature '{r.name}': {shown}")
                 if not temps:
                     print("    no temperature sensors reported")
             else:
