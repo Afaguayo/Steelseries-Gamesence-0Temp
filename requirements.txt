@@ -1,1 +1,2 @@
-psutil>=7.0  # CPU load, RAM, and CPU temperature on Linux
+psutil>=7.0                            # CPU load, RAM, and CPU temperature on Linux
+pythonnet>=3.0.5; sys_platform == "win32"  # loads LibreHardwareMonitor's sensor library on Windows
