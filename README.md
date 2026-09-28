@@ -17,7 +17,7 @@ Live CPU and GPU temperatures on your SteelSeries OLED screen, like the one on t
    - Run it **as administrator**. It needs that to read the CPU sensors.
    - Turn on **Options → Remote Web Server → Run** (default port 8085).
    - Optional: enable **Options → Start Minimized** and **Run On Windows Startup**.
-3. **This app:** download `SteelSeriesTemps.exe` from [Releases](../../releases/latest) and double-click it. A small window shows the live readings, and the OLED starts updating. Close the window to stop, and GG takes the screen back.
+3. **This app:** download `SteelSeriesTemps.exe` from [Releases](../../releases/latest) and double-click it. There's nothing to install. (It isn't code-signed, so if SmartScreen warns, click **More info → Run anyway**.) A small window shows the live readings, and the OLED starts updating. Close the window to stop, and GG takes the screen back.
 
 To start it with Windows, press `Win+R`, type `shell:startup`, and put a shortcut to `SteelSeriesTemps.exe` in that folder.
 
@@ -31,6 +31,7 @@ Needs Python 3.9 or newer.
 pip install -r requirements.txt
 python3 temps.py                    # send to SteelSeries GG until Ctrl+C
 python3 temps.py --print            # just print readings; no SteelSeries gear needed
+python3 temps.py --once             # print one reading and exit (check your sensors)
 python3 temps.py --fahrenheit       # °F
 python3 temps.py --no-rgb           # screen only; don't touch key lighting
 python3 temps.py --cool 45 --hot 85 # temperatures for full green / full red

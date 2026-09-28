@@ -277,6 +277,13 @@ class DisplayLoopTests(unittest.TestCase):
         self.assertIn("CPU 50°C  5%", out.call_args_list[-1].args[0])
         self.assertEqual(self.fake.calls, [])
 
+    def test_once_prints_one_reading(self):
+        with mock.patch.object(temps.sensors, "read_stats", return_value=Stats(cpu_temp=50, cpu_load=5, ram=30)), \
+                mock.patch("builtins.print") as out, mock.patch("sys.stderr"):
+            temps.main(["--once"])
+        self.assertEqual(out.call_count, 1)
+        self.assertIn("CPU 50°C  5%", out.call_args.args[0])
+
     def test_cli_validation(self):
         with mock.patch("sys.stderr"):
             for bad in (["--hot", "30", "--cool", "40"], ["--interval", "0.01"]):

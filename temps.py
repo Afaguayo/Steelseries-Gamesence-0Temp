@@ -5,6 +5,7 @@
     python3 temps.py --fahrenheit
     python3 temps.py --no-rgb         # screen only, leave the key lighting alone
     python3 temps.py --print          # just print readings; no SteelSeries gear needed
+    python3 temps.py --once           # print one reading and exit (check your sensors)
 
 The OLED shows two lines, for example:
 
@@ -91,7 +92,8 @@ class Display:
                 pass
 
 
-def run(args, read=sensors.read_stats, display=None, sleep=time.sleep, ticks=None):
+def run(args, read=None, display=None, sleep=time.sleep, ticks=None):
+    read = read or sensors.read_stats
     display = display or Display(rgb=not args.no_rgb)
     warned_temp = False
     waiting = False
@@ -136,6 +138,7 @@ def main(argv=None):
     ap.add_argument("--hot", type=float, default=90.0, help="°C shown as fully red (default: 90)")
     ap.add_argument("--ascii", action="store_true", help="write 54C instead of 54°C")
     ap.add_argument("--print", action="store_true", help="print readings instead of sending them to GG")
+    ap.add_argument("--once", action="store_true", help="print one reading and exit")
     args = ap.parse_args(argv)
     if args.hot <= args.cool:
         ap.error("--hot must be higher than --cool")
@@ -148,6 +151,11 @@ def main(argv=None):
 
     # psutil measures CPU load between calls, so prime it once.
     sensors.read_psutil()
+    if args.once:
+        time.sleep(0.5)                  # give psutil a moment to measure load
+        args.print = True
+        run(args, ticks=1, sleep=lambda s: None)
+        return
     if not args.print:
         print("Sending temperatures to SteelSeries GG. Press Ctrl+C to stop.", file=sys.stderr)
     run(args)
