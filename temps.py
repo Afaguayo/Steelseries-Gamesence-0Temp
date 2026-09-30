@@ -8,6 +8,8 @@
     python3 temps.py --once           # print one reading and exit (check your sensors)
     python3 temps.py --diagnose       # show what every temperature source reports
     python3 temps.py --install-driver # install PawnIO, needed for CPU temperature on Windows
+    python3 temps.py --clock          # show a clock instead of temperatures
+    python3 temps.py --clock --24h
     SteelSeriesTemps.exe --autostart on   # start with Windows, as admin, without a prompt
 
 The OLED shows two lines, for example:
@@ -19,6 +21,7 @@ and the keyboard's function-key row shades from green to red as the CPU
 heats up (between --cool and --hot degrees).
 """
 import argparse
+import datetime
 import signal
 import subprocess
 import sys
@@ -59,6 +62,24 @@ def heat_value(celsius, cool=40.0, hot=90.0):
     return round(100 * min(1.0, max(0.0, fraction)))
 
 
+DAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
+def clock_lines(now, hour24=False):
+    """The two OLED lines in clock mode: the time, then the date.
+
+    Day and month names are fixed English abbreviations rather than the
+    system locale's, so they're always plain ASCII the OLED font can draw.
+    """
+    if hour24:
+        line1 = f"{now:%H:%M:%S}"
+    else:
+        line1 = f"{now.hour % 12 or 12}:{now:%M:%S} {'AM' if now.hour < 12 else 'PM'}"
+    line2 = f"{DAYS[now.weekday()]} {MONTHS[now.month - 1]} {now.day} {now.year}"
+    return line1, line2
+
+
 class Display:
     """Sends readings to GameSense, re-registering if GG restarts."""
 
@@ -97,6 +118,44 @@ class Display:
                 pass
 
 
+def push(display, value, line1, line2, waiting, sleep):
+    """Send one frame to GG. Returns whether we're now waiting for GG to come back."""
+    try:
+        display.show(value, line1, line2)
+    except gamesense.GameSenseError as exc:
+        if not waiting:
+            print(f"\n{exc} Retrying every few seconds...", file=sys.stderr)
+        display.client = None
+        sleep(4)
+        return True
+    if waiting:
+        print("Connected to SteelSeries GG.", file=sys.stderr)
+    print(f"\r{line1}   |   {line2}      ", end="", flush=True)
+    return False
+
+
+def run_clock(args, display=None, now=datetime.datetime.now, sleep=time.sleep, ticks=None):
+    """Clock mode: time and date on the OLED, no sensors, key lighting untouched."""
+    display = display or Display(rgb=False)
+    waiting = False
+    count = 0
+    try:
+        while ticks is None or count < ticks:
+            count += 1
+            line1, line2 = clock_lines(now(), args.hour24)
+            if args.print:
+                print(f"{line1}   |   {line2}", flush=True)
+            else:
+                waiting = push(display, 0, line1, line2, waiting, sleep)
+            # Wake just after the next whole second so the seconds never skip or lag.
+            sleep(1.02 - now().microsecond / 1_000_000)
+    except KeyboardInterrupt:
+        print("\nStopped.")
+    finally:
+        if not args.print:
+            display.close()
+
+
 def run(args, read=None, display=None, sleep=time.sleep, ticks=None):
     read = read or sensors.read_stats
     display = display or Display(rgb=not args.no_rgb)
@@ -114,18 +173,8 @@ def run(args, read=None, display=None, sleep=time.sleep, ticks=None):
             if args.print:
                 print(f"{line1}   |   {line2}", flush=True)
             else:
-                try:
-                    display.show(heat_value(stats.cpu_temp, args.cool, args.hot), line1, line2)
-                    if waiting:
-                        print("Connected to SteelSeries GG.", file=sys.stderr)
-                        waiting = False
-                    print(f"\r{line1}   |   {line2}      ", end="", flush=True)
-                except gamesense.GameSenseError as exc:
-                    if not waiting:
-                        print(f"\n{exc} Retrying every few seconds...", file=sys.stderr)
-                        waiting = True
-                    display.client = None
-                    sleep(4)
+                waiting = push(display, heat_value(stats.cpu_temp, args.cool, args.hot),
+                               line1, line2, waiting, sleep)
             sleep(args.interval)
     except KeyboardInterrupt:
         print("\nStopped.")
@@ -225,6 +274,9 @@ def main(argv=None):
     ap.add_argument("--cool", type=float, default=40.0, help="°C shown as fully green (default: 40)")
     ap.add_argument("--hot", type=float, default=90.0, help="°C shown as fully red (default: 90)")
     ap.add_argument("--ascii", action="store_true", help="write 54C instead of 54°C")
+    ap.add_argument("--clock", action="store_true",
+                    help="show the time and date instead of temperatures (no sensors needed)")
+    ap.add_argument("--24h", dest="hour24", action="store_true", help="24-hour clock (with --clock)")
     ap.add_argument("--print", action="store_true", help="print readings instead of sending them to GG")
     ap.add_argument("--once", action="store_true", help="print one reading and exit")
     ap.add_argument("--diagnose", action="store_true", help="show what every temperature source reports")
@@ -258,6 +310,16 @@ def main(argv=None):
         pawnio.save_settings(settings)
         ok = pawnio.install()
         print("PawnIO installed. Restart SteelSeriesTemps." if ok else "PawnIO setup didn't finish.")
+        return
+
+    if args.clock:
+        if args.once:
+            args.print = True
+            run_clock(args, ticks=1, sleep=lambda s: None)
+            return
+        if not args.print:
+            print("Showing a clock on SteelSeries GG. Press Ctrl+C to stop.", file=sys.stderr)
+        run_clock(args)
         return
 
     builtin = open_builtin()

@@ -21,6 +21,15 @@ Live CPU and GPU temperatures on your SteelSeries OLED screen, like the one on t
 
 **Start it with Windows:** run `SteelSeriesTemps.exe --autostart on` once (and `--autostart off` to undo). It creates a Task Scheduler entry that starts it at login with admin rights, so there's no permission prompt every time.
 
+**Just want a clock?** Run `SteelSeriesTemps.exe --clock` (add `--24h` for 24-hour time). The OLED shows the time and date instead of temperatures, updating every second, and the key lighting is left alone. It doesn't read any sensors, so it needs no driver.
+
+```text
+┌────────────────┐
+│ 9:05:07 PM     │
+│ Tue Sep 29 2026│
+└────────────────┘
+```
+
 **Temperature not showing?** Run `SteelSeriesTemps.exe --diagnose`. It lists every source it tried and what each one returned, and says what's missing. For example, it tells you if PawnIO isn't installed or if the app isn't running as administrator. `SteelSeriesTemps.exe --install-driver` asks about PawnIO again if you said no the first time.
 
 ## Where the readings come from
@@ -53,6 +62,8 @@ python3 temps.py --fahrenheit       # °F
 python3 temps.py --no-rgb           # screen only; don't touch key lighting
 python3 temps.py --cool 45 --hot 85 # temperatures for full green / full red
 python3 temps.py --ascii            # 54C instead of 54°C, if your screen lacks the ° symbol
+python3 temps.py --clock            # time and date instead of temperatures
+python3 temps.py --clock --24h      # 24-hour clock
 ```
 
 On Windows, from source, run `python build.py` once to download the sensor library (or use the .exe). On Linux, CPU temperatures come from psutil. On macOS, install [`smctemp`](https://github.com/narugit/smctemp).
