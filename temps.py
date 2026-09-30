@@ -10,6 +10,9 @@
     python3 temps.py --install-driver # install PawnIO, needed for CPU temperature on Windows
     python3 temps.py --clock          # show a clock instead of temperatures
     python3 temps.py --clock --24h
+    SteelSeriesTemps.exe                  # (no options) open the settings window
+    python3 temps.py --gui            # the settings window, from source
+    python3 temps.py --background     # run with the saved settings, from the tray
     SteelSeriesTemps.exe --autostart on   # start with Windows, as admin, without a prompt
 
 The OLED shows two lines, for example:
@@ -30,6 +33,7 @@ import time
 import gamesense
 import pawnio
 import sensors
+import startup
 
 
 def fmt_temp(celsius, fahrenheit=False, ascii_only=False):
@@ -241,22 +245,13 @@ def diagnose(builtin=None):
         print("\nCPU temperature is working.")
 
 
-TASK_NAME = "SteelSeriesTemps"
+TASK_NAME = startup.TASK_NAME
 
 
 def autostart(enable, exe=None, run=subprocess.run):
-    """Start with Windows via a logon task with highest privileges.
-
-    A Startup-folder shortcut would show a UAC prompt at every login because
-    the app needs administrator rights; a scheduled task doesn't.
-    """
-    if enable:
-        exe = exe or sys.executable
-        command = ["schtasks", "/Create", "/TN", TASK_NAME, "/TR", f'"{exe}"',
-                   "/SC", "ONLOGON", "/RL", "HIGHEST", "/F"]
-    else:
-        command = ["schtasks", "/Delete", "/TN", TASK_NAME, "/F"]
-    return run(command, capture_output=True, text=True).returncode == 0
+    """Start in the background at Windows login (a Task Scheduler logon task, as admin)."""
+    command = [exe, "--background"] if exe else None
+    return startup.set_enabled(enable, command, platform="win32", run=run)
 
 
 def open_builtin():
@@ -264,6 +259,73 @@ def open_builtin():
     if not sensors.IS_WINDOWS:
         return None
     return sensors.BuiltinSensors()
+
+
+class LazyStats:
+    """Sensor reading for the settings window and --background.
+
+    The sensor library is only loaded the first time temperatures are
+    actually needed, so a clock or Spotify screen never pays for it.
+    """
+
+    def __init__(self, opener=open_builtin):
+        self.opener = opener
+        self.reader = None
+        self.builtin = None
+
+    def __call__(self):
+        if self.reader is None:
+            self.builtin = self.opener()
+            self.reader = sensors.SensorReader(self.builtin)
+            sensors.read_psutil()                # psutil measures CPU load between calls
+        return self.reader.read()
+
+    def reset(self):
+        """Reload the sensor library (after installing PawnIO)."""
+        self.close()
+        self.reader = None
+
+    def close(self):
+        if self.builtin is not None:
+            self.builtin.close()
+            self.builtin = None
+
+
+def spotify_status():
+    import spotify
+    reader = spotify.SpotifyReader()
+    try:
+        track = reader.read()
+    finally:
+        reader.close()
+    if reader.media is not None and not reader.media.ok:
+        print(f"Windows media controls: not available ({reader.media.error})")
+    if track is None:
+        shown = "Spotify not running"
+    elif not track.title:
+        shown = "Spotify open, nothing playing"
+    else:
+        shown = f"{'playing' if track.playing else 'paused'}: {track.artist} - {track.title}"
+        if track.duration:
+            shown += f" ({spotify.fmt_time(track.elapsed())} / {spotify.fmt_time(track.duration)})"
+    print(f"Spotify reader: {reader.name}. {shown}")
+
+
+def open_settings_window(background=False):
+    import engine as engine_mod
+    import gui
+    import settings as settings_mod
+    import spotify
+    if getattr(sys, "frozen", False):
+        gui.hide_console()
+    stats = LazyStats()
+    reader = spotify.SpotifyReader(threaded=True)
+    oled = engine_mod.Engine(settings_mod.load(), stats_reader=stats, spotify_reader=reader)
+    try:
+        gui.main(oled, background=background, stats=stats)
+    finally:
+        reader.close()
+        stats.close()
 
 
 def main(argv=None):
@@ -282,8 +344,12 @@ def main(argv=None):
     ap.add_argument("--diagnose", action="store_true", help="show what every temperature source reports")
     ap.add_argument("--install-driver", action="store_true",
                     help="install PawnIO, the driver needed for CPU temperature on Windows")
+    ap.add_argument("--gui", action="store_true", help="open the settings window (the default for the .exe)")
+    ap.add_argument("--background", action="store_true",
+                    help="run with the saved settings from the tray icon (used when starting at login)")
     ap.add_argument("--autostart", choices=["on", "off"],
                     help="start automatically when you log in to Windows (uses Task Scheduler)")
+    frozen_default = argv is None and getattr(sys, "frozen", False) and len(sys.argv) == 1
     args = ap.parse_args(argv)
     if args.hot <= args.cool:
         ap.error("--hot must be higher than --cool")
@@ -294,10 +360,14 @@ def main(argv=None):
     # clean shutdown, which hands the OLED back to GG.
     signal.signal(signal.SIGTERM, signal.default_int_handler)
 
+    if args.gui or args.background or frozen_default:
+        open_settings_window(background=args.background)
+        return
+
     if args.autostart:
         if not sensors.IS_WINDOWS or not getattr(sys, "frozen", False):
             ap.error("--autostart works with SteelSeriesTemps.exe on Windows")
-        ok = autostart(args.autostart == "on")
+        ok = startup.set_enabled(args.autostart == "on")
         state = "will start" if args.autostart == "on" else "won't start"
         print(f"SteelSeriesTemps {state} when you log in." if ok else "Couldn't change the startup task.")
         return
@@ -328,6 +398,8 @@ def main(argv=None):
             sensors.read_psutil()
             time.sleep(0.5)
             diagnose(builtin)
+            print()
+            spotify_status()
             return
 
         # On Windows, CPU temperature needs the PawnIO driver: offer it once.
@@ -340,14 +412,14 @@ def main(argv=None):
         if sensors.IS_WINDOWS and not sensors.is_admin():
             print("Note: not running as administrator, so CPU temperature may be missing.", file=sys.stderr)
 
-        read = lambda: sensors.read_stats(builtin)  # noqa: E731
         # psutil measures CPU load between calls, so prime it once.
         sensors.read_psutil()
         if args.once:
             time.sleep(0.5)                  # give psutil a moment to measure load
             args.print = True
-            run(args, read=read, ticks=1, sleep=lambda s: None)
+            run(args, read=lambda: sensors.read_stats(builtin), ticks=1, sleep=lambda s: None)
             return
+        read = sensors.SensorReader(builtin).read
         if not args.print:
             print("Sending temperatures to SteelSeries GG. Press Ctrl+C to stop.", file=sys.stderr)
         run(args, read=read)
