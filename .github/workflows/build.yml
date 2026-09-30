@@ -74,6 +74,11 @@ jobs:
           # 3. Settings window open on temperatures (loads the sensor library)
           '{"autostart_asked": true, "show": "temps", "pawnio_declined": true}' | Set-Content $settings
           & dist\SteelSeriesTemps.exe --gui 2>&1 | Out-String | Write-Output
+          # 4. No options at all, like a double-click: must open the settings window, not the text mode
+          '{"autostart_asked": true, "show": "clock"}' | Set-Content $settings
+          $out = & dist\SteelSeriesTemps.exe 2>&1 | Out-String
+          Write-Output $out
+          if ($out -notmatch 'Self-test \(window open') { Stop-Process $gg; exit 1 }
           Stop-Process $gg
           python ci_fake_gg.py --check gg.log
       - name: Try PawnIO on this cloud machine (cloud CPUs often hide sensors, so this can't fail the build)
