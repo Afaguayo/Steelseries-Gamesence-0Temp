@@ -516,7 +516,7 @@ class AutostartTests(unittest.TestCase):
         self.assertTrue(ok)
         cmd = seen[0]
         self.assertEqual(cmd[:4], ["schtasks", "/Create", "/TN", "SteelSeriesTemps"])
-        self.assertIn('"C:\\Apps\\SteelSeriesTemps.exe"', cmd)
+        self.assertIn('"C:\\Apps\\SteelSeriesTemps.exe" --background', cmd)   # starts quietly in the tray
         self.assertEqual(cmd[cmd.index("/SC") + 1], "ONLOGON")
         self.assertEqual(cmd[cmd.index("/RL") + 1], "HIGHEST")
 

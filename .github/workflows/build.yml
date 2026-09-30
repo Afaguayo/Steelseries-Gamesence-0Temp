@@ -25,11 +25,18 @@ jobs:
       - name: Get LibreHardwareMonitor's library (Windows)
         if: runner.os == 'Windows'
         run: python -c "import build; build.fetch_lhm('lhm-ci')"
+      - name: Virtual display for the settings-window tests (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y xvfb
       - name: Run tests
         shell: bash
         run: |
-          if [ "$RUNNER_OS" = "Windows" ]; then export LHM_DIR="$PWD/lhm-ci"; fi
-          python -m unittest -v
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            export LHM_DIR="$PWD/lhm-ci"
+            python -m unittest -v
+          else
+            xvfb-run -a python -m unittest -v
+          fi
 
   build:
     needs: test
@@ -47,6 +54,33 @@ jobs:
           $out = & dist\SteelSeriesTemps.exe --diagnose 2>&1 | Out-String
           Write-Output $out
           if ($LASTEXITCODE -ne 0 -or $out -notmatch 'Built-in sensor library: loaded') { exit 1 }
+          # Spotify: the winrt packages must be inside the .exe (a missing module would show here)
+          if ($out -notmatch 'Spotify reader: ' -or $out -match 'No module named') { exit 1 }
+      - name: Run the .exe against a fake SteelSeries GG (settings window, tray mode, CPU use)
+        shell: pwsh
+        run: |
+          $gg = Start-Process python -ArgumentList 'ci_fake_gg.py','51234','gg.log' -PassThru -NoNewWindow
+          New-Item -ItemType Directory -Force "$env:PROGRAMDATA\SteelSeries\GG" | Out-Null
+          '{"address": "127.0.0.1:51234"}' | Set-Content "$env:PROGRAMDATA\SteelSeries\GG\coreProps.json"
+          $settings = "$env:APPDATA\SteelSeriesTemps\settings.json"
+          New-Item -ItemType Directory -Force (Split-Path $settings) | Out-Null
+          $env:SST_EXIT_AFTER = "10"
+          # 1. Tray mode, animated clock (the heaviest screen): about 12 frames a second
+          '{"autostart_asked": true, "show": "clock", "designs": {"clock": {"background": "stars"}}}' | Set-Content $settings
+          & dist\SteelSeriesTemps.exe --background 2>&1 | Out-String | Write-Output
+          # 2. Tray mode, plain clock: one frame a second
+          '{"autostart_asked": true, "show": "clock"}' | Set-Content $settings
+          & dist\SteelSeriesTemps.exe --background 2>&1 | Out-String | Write-Output
+          # 3. Settings window open on temperatures (loads the sensor library)
+          '{"autostart_asked": true, "show": "temps", "pawnio_declined": true}' | Set-Content $settings
+          & dist\SteelSeriesTemps.exe --gui 2>&1 | Out-String | Write-Output
+          # 4. No options at all, like a double-click: must open the settings window, not the text mode
+          '{"autostart_asked": true, "show": "clock"}' | Set-Content $settings
+          $out = & dist\SteelSeriesTemps.exe 2>&1 | Out-String
+          Write-Output $out
+          if ($out -notmatch 'Self-test \(window open') { Stop-Process $gg; exit 1 }
+          Stop-Process $gg
+          python ci_fake_gg.py --check gg.log
       - name: Try PawnIO on this cloud machine (cloud CPUs often hide sensors, so this can't fail the build)
         continue-on-error: true
         shell: pwsh

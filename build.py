@@ -36,6 +36,14 @@ def fetch_lhm(target="build/lhm"):
     return target
 
 
+def make_icon(path="build/icon.ico"):
+    """The .exe icon: the same little OLED picture as the tray icon."""
+    import gui
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    gui.tray_icon_image().save(path, sizes=[(16, 16), (32, 32), (48, 48), (64, 64)])
+    return path
+
+
 if __name__ == "__main__":
     import PyInstaller.__main__
 
@@ -43,12 +51,20 @@ if __name__ == "__main__":
     PyInstaller.__main__.run([
         "--noconfirm",
         "--onefile",
-        "--console",           # a small window showing the live readings; close it to stop
+        "--console",           # command-line modes print here; the settings window hides it
         "--uac-admin",         # CPU temperature needs administrator rights
         "--name", "SteelSeriesTemps",
+        "--icon", make_icon(),
         f"--add-data={lhm}{os.pathsep}lhm",
         "--collect-all", "pythonnet",
         "--collect-all", "clr_loader",
         "--hidden-import", "clr",
+        # Spotify through the Windows media controls (namespace packages PyInstaller can't see on its own)
+        "--collect-all", "winrt",
+        "--hidden-import", "winrt.windows.media.control",
+        "--hidden-import", "winrt.windows.foundation",
+        "--hidden-import", "winrt.windows.foundation.collections",
+        "--hidden-import", "pystray._win32",
+        "--hidden-import", "PIL._tkinter_finder",
         "temps.py",
     ])

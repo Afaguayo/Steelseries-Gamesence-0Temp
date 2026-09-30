@@ -462,6 +462,39 @@ def read_stats(builtin=None):
     return stats
 
 
+class SensorReader:
+    """read_stats() that remembers which sources came back empty.
+
+    A source that found nothing (no HWiNFO running, no NVIDIA card...) is
+    skipped for `retry` seconds instead of being asked every second, which
+    saves starting nvidia-smi or opening a connection on every update.
+    """
+
+    def __init__(self, builtin=None, retry=30.0, clock=None):
+        import time
+        self.builtin = builtin
+        self.retry = retry
+        self.clock = clock or time.monotonic
+        self.skip_until = {}
+
+    def read(self):
+        now = self.clock()
+        stats = Stats()
+        for name, reader in sources(self.builtin):
+            if self.skip_until.get(name, 0) > now:
+                continue
+            try:
+                reading = reader()
+            except Exception:
+                reading = Stats()
+            if reading == Stats():
+                self.skip_until[name] = now + self.retry
+            stats.merge(reading)
+            if None not in (stats.cpu_temp, stats.cpu_load, stats.gpu_temp, stats.gpu_load, stats.ram):
+                break
+        return stats
+
+
 def is_admin():
     if not IS_WINDOWS:
         return os.geteuid() == 0 if hasattr(os, "geteuid") else False
