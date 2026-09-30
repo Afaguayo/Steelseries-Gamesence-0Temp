@@ -6,6 +6,7 @@ A fake GameSense server stands in for SteelSeries GG, so no SteelSeries
 hardware or software is needed.
 """
 import argparse
+import datetime
 import json
 import os
 import tempfile
@@ -292,6 +293,56 @@ class DisplayLoopTests(unittest.TestCase):
             for bad in (["--hot", "30", "--cool", "40"], ["--interval", "0.01"]):
                 with self.subTest(args=bad), self.assertRaises(SystemExit):
                     temps.main(bad)
+
+
+class ClockTests(unittest.TestCase):
+    def setUp(self):
+        self.fake = FakeGameSense()
+        self.args = argparse.Namespace(hour24=False, print=False)
+
+    def tearDown(self):
+        self.fake.close()
+
+    def test_12_and_24_hour(self):
+        t = datetime.datetime(2026, 9, 29, 21, 5, 7)
+        self.assertEqual(temps.clock_lines(t), ("9:05:07 PM", "Tue Sep 29 2026"))
+        self.assertEqual(temps.clock_lines(t, hour24=True), ("21:05:07", "Tue Sep 29 2026"))
+
+    def test_midnight_and_noon(self):
+        self.assertEqual(temps.clock_lines(datetime.datetime(2026, 1, 1, 0, 0, 0))[0], "12:00:00 AM")
+        self.assertEqual(temps.clock_lines(datetime.datetime(2026, 1, 1, 12, 0, 0))[0], "12:00:00 PM")
+
+    def test_lines_fit_small_screens(self):
+        longest = datetime.datetime(2026, 12, 30, 23, 59, 59)
+        for hour24 in (False, True):
+            for line in temps.clock_lines(longest, hour24):
+                self.assertLessEqual(len(line), 16)
+                self.assertTrue(line.isascii())
+
+    def test_clock_sends_time_without_touching_key_lights(self):
+        times = iter(datetime.datetime(2026, 9, 29, 21, 5, s, 400_000) for s in range(10))
+        display = temps.Display(rgb=False, client_factory=lambda: gamesense.GameSense(self.fake.address))
+        sleeps = []
+        with mock.patch("sys.stdout"), mock.patch("sys.stderr"):
+            temps.run_clock(self.args, display=display, now=lambda: next(times),
+                            sleep=sleeps.append, ticks=2)
+        self.assertEqual(self.fake.endpoints(),
+                         ["game_metadata", "bind_game_event", "game_event", "game_event", "stop_game"])
+        handlers = self.fake.calls[1][1]["handlers"]
+        self.assertEqual([h["device-type"] for h in handlers], ["screened"])
+        frames = [body["data"]["frame"]["line1"] for ep, body in self.fake.calls if ep == "game_event"]
+        self.assertEqual(frames, ["9:05:00 PM", "9:05:02 PM"])
+        self.assertAlmostEqual(sleeps[0], 0.62)      # wakes just after the next second
+
+    def test_clock_once_prints_and_needs_no_sensors(self):
+        with mock.patch.object(temps.sensors, "read_stats") as read, \
+                mock.patch.object(temps, "open_builtin") as builtin, \
+                mock.patch("builtins.print") as out, mock.patch("sys.stderr"):
+            temps.main(["--clock", "--24h", "--once"])
+        read.assert_not_called()
+        builtin.assert_not_called()
+        self.assertEqual(out.call_count, 1)
+        self.assertRegex(out.call_args.args[0], r"^\d\d:\d\d:\d\d   \|   \w{3} \w{3} \d+ \d{4}$")
 
 
 # LibreHardwareMonitor 0.9.x data.json: hardware carries HardwareId, sensors
