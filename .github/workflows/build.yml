@@ -97,3 +97,34 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: dist/SteelSeriesTemps.exe
+
+  build-linux:
+    needs: test
+    # The oldest supported Ubuntu: a program built against an older glibc runs on newer distros too.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install -r requirements.txt pyinstaller
+      - run: python build.py
+      - name: Start the Linux program (settings window on a virtual display, and the command line)
+        run: |
+          sudo apt-get install -y xvfb
+          chmod +x dist/SteelSeriesTemps-linux-x86_64
+          dist/SteelSeriesTemps-linux-x86_64 --once
+          dist/SteelSeriesTemps-linux-x86_64 --clock --once
+          dist/SteelSeriesTemps-linux-x86_64 --diagnose
+          out=$(SST_EXIT_AFTER=6 xvfb-run -a dist/SteelSeriesTemps-linux-x86_64 2>&1)
+          echo "$out"
+          echo "$out" | grep -q "Self-test (window open"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SteelSeriesTemps-Linux
+          path: dist/SteelSeriesTemps-linux-x86_64
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/SteelSeriesTemps-linux-x86_64

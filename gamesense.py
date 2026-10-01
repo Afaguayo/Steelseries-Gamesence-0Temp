@@ -40,7 +40,11 @@ def core_props_paths():
 
 def find_address(paths=None):
     """'127.0.0.1:PORT' of the running GameSense server."""
-    for path in paths if paths is not None else core_props_paths():
+    paths = paths if paths is not None else core_props_paths()
+    if not paths:
+        raise GameSenseError("SteelSeries GG doesn't exist for Linux, so the keyboard's screen can't be "
+                             "updated here. The preview, Spotify and --print still work.")
+    for path in paths:
         try:
             with open(path, encoding="utf-8") as f:
                 address = json.load(f).get("address")

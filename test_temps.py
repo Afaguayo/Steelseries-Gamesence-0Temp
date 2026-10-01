@@ -123,8 +123,11 @@ class CorePropsTests(unittest.TestCase):
             self.assertEqual(gamesense.find_address([missing, broken, good]), "127.0.0.1:51234")
 
     def test_missing_gg_is_explained(self):
-        with self.assertRaisesRegex(gamesense.GameSenseError, "isn't running"):
-            gamesense.find_address([])
+        with tempfile.TemporaryDirectory() as folder:
+            with self.assertRaisesRegex(gamesense.GameSenseError, "isn't running"):
+                gamesense.find_address([os.path.join(folder, "coreProps.json")])
+        with self.assertRaisesRegex(gamesense.GameSenseError, "doesn't exist for Linux"):
+            gamesense.find_address([])                     # Linux: no place GG could be
 
     def test_paths_per_platform(self):
         with mock.patch.object(gamesense.sys, "platform", "win32"), \
