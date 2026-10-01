@@ -1,10 +1,12 @@
-"""Build SteelSeriesTemps.exe with PyInstaller (output in dist/).
+"""Build SteelSeriesTemps.exe (Windows) or SteelSeriesTemps-linux-x86_64 (Linux)
+with PyInstaller (output in dist/).
 
     pip install -r requirements.txt pyinstaller
     python build.py
 
-Downloads LibreHardwareMonitor's sensor library (MPL-2.0) and packs it into
-the .exe, so CPU/GPU temperatures work without installing any other app.
+On Windows it downloads LibreHardwareMonitor's sensor library (MPL-2.0) and
+packs it into the .exe, so CPU/GPU temperatures work without installing any
+other app. Linux reads temperatures through psutil and needs nothing extra.
 """
 import io
 import os
@@ -44,9 +46,26 @@ def make_icon(path="build/icon.ico"):
     return path
 
 
+LINUX_NAME = "SteelSeriesTemps-linux-x86_64"
+
+
+def linux_options():
+    """A single Linux program: the settings window, Spotify (playerctl) and the command-line modes."""
+    return [
+        "--noconfirm",
+        "--onefile",
+        "--name", LINUX_NAME,
+        "--hidden-import", "PIL._tkinter_finder",
+        "temps.py",
+    ]
+
+
 if __name__ == "__main__":
     import PyInstaller.__main__
 
+    if sys.platform.startswith("linux"):
+        PyInstaller.__main__.run(linux_options())
+        sys.exit()
     lhm = fetch_lhm()
     PyInstaller.__main__.run([
         "--noconfirm",

@@ -28,6 +28,22 @@ Your SteelSeries OLED screen (Apex Pro, Apex 7, Rival 700, Arctis bases) as a li
 
 Closing the window keeps the screen running from the **tray icon**. Right-click it and choose **Open settings** or **Quit**; quitting hands the screen back to GG.
 
+## Linux
+
+Download **`SteelSeriesTemps-linux-x86_64`** from [Releases](../../releases/latest), then:
+
+```bash
+chmod +x SteelSeriesTemps-linux-x86_64
+./SteelSeriesTemps-linux-x86_64          # the settings window
+./SteelSeriesTemps-linux-x86_64 --print  # temperatures in the terminal
+```
+
+It runs on Ubuntu 22.04 or newer and similar distros (64-bit Intel/AMD).
+
+**What works on Linux:** the settings window with its live preview and designs, the Spotify reader (install `playerctl`), temperatures through psutil, and start at login (an autostart entry in `~/.config/autostart`).
+
+**What doesn't, yet:** the keyboard's own screen. The app draws on it through SteelSeries GG, and GG doesn't exist for Linux, so the window says so instead of updating the keyboard.
+
 ## The settings window
 
 | Tab | What you set |
